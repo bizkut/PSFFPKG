@@ -7,61 +7,80 @@ import subprocess
 import argparse
 import tempfile
 import shutil
-import ctypes
 import time
 from pathlib import Path
 
-# Name of the tool executable (searched next to the script or in PATH)
-TOOL_EXE = "UFS2Tool.exe"
+# ---------------------------------------------------------------------------
+# Platform helpers
+# ---------------------------------------------------------------------------
+IS_WINDOWS = sys.platform == "win32"
 
-def is_admin():
-    """Check if the script is running with administrator privileges."""
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
+def _resolve_tool():
+    """Locate UFS2Tool and determine how to launch it.
 
-def elevate_if_needed():
-    """If not admin, restart the script with admin rights and exit."""
-    if is_admin():
-        return True
+    Resolution order (all paths checked next to the script first, then PATH):
+    1. UFS2TOOL_PATH environment variable (points to exe, dll, or native binary)
+    2. Native binary  : UFS2Tool
+    3. .NET DLL       : UFS2Tool.dll  (requires 'dotnet' in PATH)
+    4. Windows binary : UFS2Tool.exe  (requires 'wine' on non-Windows)
 
-    print("[INFO] Administrator privileges required. Requesting elevation...")
-
-    # Build command line: python.exe script.py [arguments]
-    script = sys.argv[0]
-    params = ' '.join(sys.argv[1:]) if len(sys.argv) > 1 else ''
-
-    # Use ShellExecuteW with 'runas' verb to request elevation
-    ret = ctypes.windll.shell32.ShellExecuteW(
-        None,               # hwnd
-        "runas",            # operation
-        sys.executable,     # file (python interpreter)
-        f'"{script}" {params}',  # parameters
-        None,               # directory
-        1                   # SW_SHOWNORMAL
-    )
-
-    # ShellExecute returns a value > 32 if successful
-    if ret <= 32:
-        print("[ERROR] Failed to elevate. Please run the script as Administrator manually.")
-        sys.exit(1)
-    else:
-        # Elevation requested, exit this instance
-        sys.exit(0)
-
-def locate_tool():
-    """Find UFS2Tool.exe next to the script or in the PATH environment variable"""
+    Returns a list that can be passed directly to subprocess (e.g. [tool_path]
+    or ["wine", tool_path] or ["dotnet", dll_path]).
+    """
     script_dir = Path(__file__).parent
-    tool_path = script_dir / TOOL_EXE
-    if tool_path.is_file():
-        return str(tool_path)
-    which_tool = shutil.which(TOOL_EXE)
-    if which_tool:
-        return which_tool
+
+    # Helper: check next to script, then PATH
+    def _find(name):
+        local = script_dir / name
+        if local.is_file():
+            return str(local)
+        found = shutil.which(name)
+        if found:
+            return found
+        return None
+
+    # 1. Explicit override from environment
+    env_path = os.environ.get("UFS2TOOL_PATH")
+    if env_path:
+        p = Path(env_path)
+        if p.is_file():
+            if env_path.endswith(".dll") and shutil.which("dotnet"):
+                return ["dotnet", str(p)]
+            if not IS_WINDOWS and env_path.endswith(".exe"):
+                wine = shutil.which("wine")
+                if wine:
+                    return [wine, str(p)]
+            return [str(p)]
+
+    # 2. Native binary (Unix or Windows)
+    native = _find("UFS2Tool")
+    if native:
+        return [native]
+
+    # 3. .NET DLL (requires dotnet CLI)
+    dotnet = shutil.which("dotnet")
+    if dotnet:
+        dll = _find("UFS2Tool.dll")
+        if dll:
+            return [dotnet, dll]
+
+    # 4. Windows .exe  — native on Windows, Wine fallback on Unix
+    exe = _find("UFS2Tool.exe")
+    if exe:
+        if not IS_WINDOWS:
+            wine = shutil.which("wine")
+            if wine:
+                return [wine, exe]
+        return [exe]
+
     raise FileNotFoundError(
-        f"{TOOL_EXE} not found. Please place it next to the script or in your PATH."
+        "UFS2Tool not found. Options:\n"
+        "  • Place a native 'UFS2Tool' binary next to the script or in PATH\n"
+        "  • Place 'UFS2Tool.dll' next to the script and install .NET 8+ SDK\n"
+        "  • Place 'UFS2Tool.exe' next to the script (Wine required on macOS/Linux)\n"
+        "  • Set UFS2TOOL_PATH to the full path of the tool."
     )
+
 
 def calculate_directory_size_bytes(path):
     """Calculate the actual size of a directory in bytes (sum of all file sizes)"""
@@ -71,14 +90,14 @@ def calculate_directory_size_bytes(path):
             total += entry.stat().st_size
     return total
 
-def run_newfs_with_D(tool_path, input_dir, output_image):
+
+def run_newfs_with_D(tool_cmd, input_dir, output_image):
     """
     Run command:
-    UFS2Tool.exe newfs -O 2 -b 32768 -f 4096 -D <input_dir> <output_image>
-    Shows live output from UFS2Tool.exe.
+    UFS2Tool newfs -O 2 -b 32768 -f 4096 -D <input_dir> <output_image>
+    Shows live output from the tool.
     """
-    cmd = [
-        tool_path,
+    cmd = tool_cmd + [
         "newfs",
         "-O", "2",
         "-b", "32768",
@@ -91,7 +110,7 @@ def run_newfs_with_D(tool_path, input_dir, output_image):
     print("-" * 50)
 
     try:
-        # Run the command without capturing output – UFS2Tool writes directly to console
+        # Run the command without capturing output – the tool writes directly to console
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError:
         print("[ERROR] UFS2Tool execution failed.")
@@ -119,9 +138,6 @@ def interactive_input():
     return in_dir, out_dir
 
 def main():
-    # --- Elevation check ---
-    elevate_if_needed()
-
     # Detect execution mode: use argparse if arguments are provided
     if len(sys.argv) > 1:
         parser = argparse.ArgumentParser(
@@ -164,7 +180,7 @@ def main():
 
     # Locate the tool
     try:
-        tool_path = locate_tool()
+        tool_cmd = _resolve_tool()
     except FileNotFoundError as e:
         print(f"❌ {e}")
         sys.exit(1)
@@ -177,7 +193,7 @@ def main():
     temp_file.close()
 
     try:
-        run_newfs_with_D(tool_path, input_dir, temp_path)
+        run_newfs_with_D(tool_cmd, input_dir, temp_path)
 
         if os.path.exists(final_path):
             os.remove(final_path)
@@ -190,9 +206,11 @@ def main():
             os.unlink(temp_path)
         sys.exit(1)
 
-    # Keep window open for 5 seconds before exiting
-    print("\n[INFO] Window will close automatically in 5 seconds...")
-    time.sleep(5)
+    # On Windows, when launched from Explorer, keep the window open briefly
+    # so the user can see the result.  On Unix the user already has a terminal.
+    if IS_WINDOWS:
+        print("\n[INFO] Window will close automatically in 5 seconds...")
+        time.sleep(5)
 
 if __name__ == "__main__":
     main()
